@@ -1,6 +1,6 @@
-# GitHub Copilot usage extension
+# pi-github-copilot-usage
 
-Shows your GitHub Copilot plan usage in pi's footer.
+Pi extension that shows your GitHub Copilot plan usage in pi's footer.
 
 ## What it displays
 

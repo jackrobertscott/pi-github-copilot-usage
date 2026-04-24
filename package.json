@@ -1,5 +1,5 @@
 {
-  "name": "pi-extension-github-copilot-usage",
+  "name": "pi-github-copilot-usage",
   "version": "1.0.0",
   "private": true,
   "description": "Shows your GitHub Copilot usage in pi's footer.",
@@ -15,12 +15,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jackrobertscott/github-copilot-usage.git"
+    "url": "git+https://github.com/jackrobertscott/pi-github-copilot-usage.git"
   },
   "bugs": {
-    "url": "https://github.com/jackrobertscott/github-copilot-usage/issues"
+    "url": "https://github.com/jackrobertscott/pi-github-copilot-usage/issues"
   },
-  "homepage": "https://github.com/jackrobertscott/github-copilot-usage#readme",
+  "homepage": "https://github.com/jackrobertscott/pi-github-copilot-usage#readme",
   "engines": {
     "node": ">=20.6.0"
   },
