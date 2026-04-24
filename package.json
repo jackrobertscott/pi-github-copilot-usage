@@ -25,7 +25,8 @@
     "node": ">=20.6.0"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.70.0"
+    "@mariozechner/pi-coding-agent": "^0.70.0",
+    "@mariozechner/pi-tui": "^0.70.0"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
