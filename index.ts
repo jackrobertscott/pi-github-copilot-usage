@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
+import { Box, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import type { Component } from "@mariozechner/pi-tui";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -87,7 +88,18 @@ type UsageReportMessageDetails =
 			message: string;
 	  };
 
+type UsageTableValueRow = {
+	bucket: string;
+	used: string;
+	total: string;
+	remaining: string;
+	left: string;
+	overage: string;
+	reset: string;
+};
+
 type TableColumn = {
+	key: keyof UsageTableValueRow;
 	header: string;
 	align?: "left" | "right";
 };
@@ -504,72 +516,221 @@ function toReportDetails(usage: UsageState): UsageReportMessageDetails {
 	};
 }
 
-function padCell(text: string, width: number, align: "left" | "right"): string {
-	return align === "right" ? text.padStart(width, " ") : text.padEnd(width, " ");
+function toUsageTableValueRows(rows: UsageRow[]): UsageTableValueRow[] {
+	return rows.map((row) => ({
+		bucket: formatKind(row.kind),
+		used: formatNumber(row.used),
+		total: row.unlimited ? "∞" : formatNumber(row.total),
+		remaining: row.unlimited ? "∞" : formatNumber(row.remaining),
+		left: formatPercent(row.percentRemaining),
+		overage: row.overageCount !== null ? `+${formatNumber(row.overageCount)}` : row.overageEnabled ? "allowed" : "—",
+		reset: formatResetDate(row.resetDate) ?? "—",
+	}));
 }
 
-function renderAsciiTable(columns: TableColumn[], rows: string[][]): string {
-	const widths = columns.map((column, index) => {
-		const rowWidths = rows.map((row) => row[index]?.length ?? 0);
-		return Math.max(column.header.length, ...rowWidths);
+function padToVisibleWidth(text: string, width: number, align: "left" | "right"): string {
+	const padding = Math.max(0, width - visibleWidth(text));
+	return align === "right" ? `${" ".repeat(padding)}${text}` : `${text}${" ".repeat(padding)}`;
+}
+
+function getTableWidths(columns: TableColumn[], rows: UsageTableValueRow[]): number[] {
+	return columns.map((column) => {
+		const rowWidths = rows.map((row) => visibleWidth(row[column.key]));
+		return Math.max(visibleWidth(column.header), ...rowWidths);
 	});
-
-	const horizontal = `+-${widths.map((width) => "-".repeat(width)).join("-+-")}-+`;
-	const renderRow = (values: string[]) =>
-		`| ${values
-			.map((value, index) => padCell(value, widths[index], columns[index]?.align ?? "left"))
-			.join(" | ")} |`;
-
-	return [horizontal, renderRow(columns.map((column) => column.header)), horizontal, ...rows.map(renderRow), horizontal].join("\n");
 }
 
-function buildUsageTable(rows: UsageRow[]): string {
-	const columns: TableColumn[] = [
-		{ header: "Bucket" },
-		{ header: "Used", align: "right" },
-		{ header: "Total", align: "right" },
-		{ header: "Remaining", align: "right" },
-		{ header: "Left", align: "right" },
-		{ header: "Overage" },
-		{ header: "Reset" },
+function getTableWidth(widths: number[]): number {
+	return 1 + widths.reduce((sum, width) => sum + width + 3, 0);
+}
+
+function renderTableBorder(
+	widths: number[],
+	chars: { left: string; middle: string; right: string },
+	theme: ExtensionContext["ui"]["theme"],
+): string {
+	return theme.fg("dim", `${chars.left}${widths.map((width) => "─".repeat(width + 2)).join(chars.middle)}${chars.right}`);
+}
+
+function styleTableCell(
+	column: TableColumn,
+	text: string,
+	theme: ExtensionContext["ui"]["theme"],
+	usageRow?: UsageRow,
+	isHeader: boolean = false,
+): string {
+	if (isHeader) {
+		return theme.fg("accent", theme.bold(text));
+	}
+
+	if (usageRow && column.key === "left" && usageRow.percentRemaining !== null) {
+		return theme.fg(getFooterPercentTone(usageRow.percentRemaining), text);
+	}
+
+	if (usageRow && column.key === "overage" && usageRow.overageCount !== null) {
+		return theme.fg("warning", text);
+	}
+
+	return text;
+}
+
+function renderTableRow(
+	columns: TableColumn[],
+	widths: number[],
+	values: UsageTableValueRow,
+	theme: ExtensionContext["ui"]["theme"],
+	usageRow?: UsageRow,
+	isHeader: boolean = false,
+): string {
+	const border = theme.fg("dim", "│");
+	const cells = columns.map((column, index) => {
+		const value = isHeader ? column.header : values[column.key];
+		const padded = padToVisibleWidth(value, widths[index] ?? 0, column.align ?? "left");
+		return ` ${styleTableCell(column, padded, theme, usageRow, isHeader)} `;
+	});
+	return `${border}${cells.join(border)}${border}`;
+}
+
+function renderUsageTable(
+	rows: UsageRow[],
+	width: number,
+	theme: ExtensionContext["ui"]["theme"],
+): string[] {
+	const valueRows = toUsageTableValueRows(rows);
+	const layouts: TableColumn[][] = [
+		[
+			{ key: "bucket", header: "Bucket" },
+			{ key: "used", header: "Used", align: "right" },
+			{ key: "total", header: "Total", align: "right" },
+			{ key: "remaining", header: "Remaining", align: "right" },
+			{ key: "left", header: "Left", align: "right" },
+			{ key: "overage", header: "Overage" },
+			{ key: "reset", header: "Reset" },
+		],
+		[
+			{ key: "bucket", header: "Bucket" },
+			{ key: "used", header: "Used", align: "right" },
+			{ key: "remaining", header: "Remaining", align: "right" },
+			{ key: "left", header: "Left", align: "right" },
+			{ key: "reset", header: "Reset" },
+		],
+		[
+			{ key: "bucket", header: "Bucket" },
+			{ key: "used", header: "Used", align: "right" },
+			{ key: "left", header: "Left", align: "right" },
+		],
 	];
 
-	const values = rows.map((row) => [
-		formatKind(row.kind),
-		formatNumber(row.used),
-		row.unlimited ? "∞" : formatNumber(row.total),
-		row.unlimited ? "∞" : formatNumber(row.remaining),
-		formatPercent(row.percentRemaining),
-		row.overageCount !== null ? `+${formatNumber(row.overageCount)}` : row.overageEnabled ? "allowed" : "—",
-		formatResetDate(row.resetDate) ?? "—",
-	]);
+	for (const columns of layouts) {
+		const widths = getTableWidths(columns, valueRows);
+		if (getTableWidth(widths) > width) continue;
 
-	return renderAsciiTable(columns, values);
+		const lines = [
+			renderTableBorder(widths, { left: "┌", middle: "┬", right: "┐" }, theme),
+			renderTableRow(
+				columns,
+				widths,
+				{ bucket: "", used: "", total: "", remaining: "", left: "", overage: "", reset: "" },
+				theme,
+				undefined,
+				true,
+			),
+			renderTableBorder(widths, { left: "├", middle: "┼", right: "┤" }, theme),
+		];
+
+		for (let index = 0; index < rows.length; index++) {
+			const usageRow = rows[index];
+			const valueRow = valueRows[index];
+			if (!usageRow || !valueRow) continue;
+			lines.push(renderTableRow(columns, widths, valueRow, theme, usageRow));
+		}
+
+		lines.push(renderTableBorder(widths, { left: "└", middle: "┴", right: "┘" }, theme));
+		return lines;
+	}
+
+	const lines: string[] = [];
+	const labelWidth = 9;
+	for (let index = 0; index < rows.length; index++) {
+		const row = rows[index];
+		const valueRow = valueRows[index];
+		if (!row || !valueRow) continue;
+		if (index > 0) {
+			lines.push(theme.fg("dim", "─".repeat(Math.max(1, width))));
+		}
+
+		lines.push(truncateToWidth(theme.fg("accent", theme.bold(valueRow.bucket)), width));
+
+		const fields: Array<{ label: string; value: string; tone?: "dim" | "warning" | "error" }> = [
+			{ label: "Used", value: `${valueRow.used}/${valueRow.total}` },
+			{ label: "Remain", value: valueRow.remaining },
+			{ label: "Left", value: valueRow.left, tone: getFooterPercentTone(row.percentRemaining) },
+			{
+				label: "Overage",
+				value: valueRow.overage,
+				tone: row.overageCount !== null ? "warning" : undefined,
+			},
+			{ label: "Reset", value: valueRow.reset },
+		];
+
+		for (const field of fields) {
+			const label = theme.fg("dim", `${field.label}:`.padEnd(labelWidth, " "));
+			const valueText = field.tone ? theme.fg(field.tone, field.value) : field.value;
+			const prefix = `  ${label} `;
+			const availableWidth = Math.max(1, width - visibleWidth(prefix));
+			lines.push(`${prefix}${truncateToWidth(valueText, availableWidth)}`);
+		}
+	}
+
+	return lines;
 }
 
-function buildReportText(details: UsageReportMessageDetails, theme: ExtensionContext["ui"]["theme"]): string {
-	const title = theme.fg("accent", theme.bold("GitHub Copilot Usage"));
+function buildReportLines(
+	details: UsageReportMessageDetails,
+	theme: ExtensionContext["ui"]["theme"],
+	width: number,
+): string[] {
+	const safeWidth = Math.max(1, width);
+	const title = truncateToWidth(theme.fg("accent", theme.bold("GitHub Copilot Usage")), safeWidth);
 
 	if (details.status === "missing-auth") {
-		return [title, "", "GitHub Copilot is not logged in.", "Run /login and choose GitHub Copilot."].join("\n");
+		return [
+			title,
+			"",
+			...wrapTextWithAnsi("GitHub Copilot is not logged in.", safeWidth),
+			...wrapTextWithAnsi("Run /login and choose GitHub Copilot.", safeWidth),
+		];
 	}
 
 	if (details.status === "error") {
-		return [title, "", theme.fg("error", details.message)].join("\n");
+		return [title, "", ...wrapTextWithAnsi(theme.fg("error", details.message), safeWidth)];
 	}
 
 	const lines = [title];
 	if (details.plan) {
-		lines.push(`${theme.fg("dim", "Plan:")} ${details.plan}`);
+		lines.push(truncateToWidth(`${theme.fg("dim", "Plan:")} ${details.plan}`, safeWidth));
 	}
 
 	const updated = formatDateTime(details.updatedAt);
 	if (updated) {
-		lines.push(`${theme.fg("dim", "Updated:")} ${updated}`);
+		lines.push(truncateToWidth(`${theme.fg("dim", "Updated:")} ${updated}`, safeWidth));
 	}
 
-	lines.push("", buildUsageTable(details.rows));
-	return lines.join("\n");
+	lines.push("", ...renderUsageTable(details.rows, safeWidth, theme));
+	return lines;
+}
+
+class CopilotUsageReportComponent implements Component {
+	constructor(
+		private readonly details: UsageReportMessageDetails,
+		private readonly theme: ExtensionContext["ui"]["theme"],
+	) {}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		return buildReportLines(this.details, this.theme, width);
+	}
 }
 
 export default function githubCopilotUsageExtension(pi: ExtensionAPI) {
@@ -630,9 +791,8 @@ export default function githubCopilotUsageExtension(pi: ExtensionAPI) {
 	pi.registerMessageRenderer(REPORT_MESSAGE_TYPE, (message, _options, theme) => {
 		const details = message.details as UsageReportMessageDetails | undefined;
 		const fallbackMessage = typeof message.content === "string" ? message.content : "Unable to render GitHub Copilot usage report.";
-		const text = buildReportText(details ?? { status: "error", message: fallbackMessage }, theme);
 		const box = new Box(1, 1, (value) => theme.bg("customMessageBg", value));
-		box.addChild(new Text(text, 0, 0));
+		box.addChild(new CopilotUsageReportComponent(details ?? { status: "error", message: fallbackMessage }, theme));
 		return box;
 	});
 

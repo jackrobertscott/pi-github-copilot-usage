@@ -7,7 +7,7 @@ Pi extension that shows your GitHub Copilot plan usage in pi's footer.
 - A low-profile footer status with used vs allocated Copilot quota plus percent left, for example `copilot 179.2/1.5k 88% left`
 - Overage-aware usage when requests exceed the included plan amount, including ratios like `1.6k/1.5k` and explicit overage display
 - The relevant quota bucket (`premium`, `chat`, `completions`, etc.) when it is useful to show
-- A `/copilot-usage` command that shows all available quota snapshots in a table
+- A `/copilot-usage` command that shows all available quota snapshots in a width-aware CLI table
 
 ## How it works
 
@@ -21,7 +21,7 @@ GitHub's API does not currently expose per-day Copilot usage history, so this ex
 
 1. Start pi in this repo, or run `/reload` if pi was already open.
 2. Look at the footer for the `copilot ...` status.
-3. Run `/copilot-usage` for a detailed table view.
+3. Run `/copilot-usage` for a detailed CLI table view.
 
 ## Development
 
