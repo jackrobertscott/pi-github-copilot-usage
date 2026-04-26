@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Box, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import type { Component } from "@mariozechner/pi-tui";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -56,6 +56,11 @@ type CopilotModelMultiplierRow = {
 	name: string;
 	paidRequestsPerMessage: number | null;
 	freeRequestsPerMessage: number | null;
+};
+
+type CopilotClientVersionInfo = {
+	pluginVersion: string | null;
+	editorVersion: string | null;
 };
 
 type UsageState =
@@ -121,10 +126,22 @@ const STATUS_KEY = "github-copilot-usage";
 const REPORT_MESSAGE_TYPE = "github-copilot-usage-report";
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_REFRESH_INTERVAL_MS = 20 * 1000;
-const USER_AGENT = "GitHubCopilotChat/0.35.0";
-const EDITOR_VERSION = "vscode/1.107.0";
-const EDITOR_PLUGIN_VERSION = "copilot-chat/0.35.0";
+const USER_AGENT_FALLBACK = "pi-github-copilot-usage";
+const COPILOT_CHAT_USER_AGENT_NAME = "GitHubCopilotChat";
+const COPILOT_CHAT_PLUGIN_NAME = "copilot-chat";
+const COPILOT_CHAT_EXTENSION_ID = "GitHub.copilot-chat";
+const COPILOT_CHAT_EXTENSION_PREFIX = "github.copilot-chat-";
 const COPILOT_INTEGRATION_ID = "vscode-chat";
+const MARKETPLACE_EXTENSION_QUERY_URL = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery";
+const MARKETPLACE_MANIFEST_ASSET_TYPE = "Microsoft.VisualStudio.Code.Manifest";
+const MARKETPLACE_QUERY_FLAGS = 103;
+const CLIENT_VERSION_INFO_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const LOCAL_COPILOT_EXTENSION_DIRS = [
+	join(homedir(), ".vscode/extensions"),
+	join(homedir(), ".vscode-insiders/extensions"),
+	join(homedir(), ".cursor/extensions"),
+	join(homedir(), ".windsurf/extensions"),
+];
 const SNAPSHOT_ORDER: SnapshotKind[] = ["premium_interactions", "premium_models", "chat", "completions"];
 const MODEL_MULTIPLIERS_URL = "https://raw.githubusercontent.com/github/docs/main/data/tables/copilot/model-multipliers.yml";
 const MODEL_MULTIPLIERS_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
@@ -133,6 +150,9 @@ let cachedModelMultiplierRows: CopilotModelMultiplierRow[] = [];
 let cachedModelMultiplierLookup = new Map<string, CopilotModelMultiplierRow>();
 let cachedModelMultiplierFetchedAt = 0;
 let modelMultiplierRefreshPromise: Promise<void> | null = null;
+let cachedCopilotClientVersionInfo: CopilotClientVersionInfo | null = null;
+let cachedCopilotClientVersionInfoFetchedAt = 0;
+let copilotClientVersionInfoRefreshPromise: Promise<CopilotClientVersionInfo | null> | null = null;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
@@ -151,6 +171,220 @@ function getNumber(record: Record<string, unknown>, key: string): number | undef
 function getBoolean(record: Record<string, unknown>, key: string): boolean | undefined {
 	const value = record[key];
 	return typeof value === "boolean" ? value : undefined;
+}
+
+function getArray(value: unknown): unknown[] {
+	return Array.isArray(value) ? value : [];
+}
+
+function compareVersionLike(a: string, b: string): number {
+	const result = a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+	return result < 0 ? -1 : result > 0 ? 1 : 0;
+}
+
+function parseVersionLike(value: string | undefined): string | null {
+	if (!value) return null;
+	const match = value.match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/);
+	return match?.[0] ?? null;
+}
+
+async function readJsonFile(path: string): Promise<unknown | null> {
+	try {
+		const text = await readFile(path, "utf8");
+		return JSON.parse(text) as unknown;
+	} catch {
+		return null;
+	}
+}
+
+function getCopilotEditorVersionFromManifest(value: unknown): string | null {
+	if (!isRecord(value)) return null;
+	const engines = value.engines;
+	if (!isRecord(engines)) return null;
+	return parseVersionLike(getString(engines, "vscode"));
+}
+
+async function findInstalledCopilotClientVersionInfo(): Promise<CopilotClientVersionInfo | null> {
+	let bestMatch: CopilotClientVersionInfo | null = null;
+
+	for (const extensionsDir of LOCAL_COPILOT_EXTENSION_DIRS) {
+		let entries;
+		try {
+			entries = await readdir(extensionsDir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			if (!entry.name.toLowerCase().startsWith(COPILOT_CHAT_EXTENSION_PREFIX)) continue;
+
+			const packageJsonPath = join(extensionsDir, entry.name, "package.json");
+			const packageJson = await readJsonFile(packageJsonPath);
+			if (!isRecord(packageJson)) continue;
+
+			const pluginVersion = parseVersionLike(getString(packageJson, "version") ?? entry.name);
+			if (!pluginVersion) continue;
+
+			const candidate: CopilotClientVersionInfo = {
+				pluginVersion,
+				editorVersion: getCopilotEditorVersionFromManifest(packageJson),
+			};
+
+			if (!bestMatch || compareVersionLike(candidate.pluginVersion ?? "", bestMatch.pluginVersion ?? "") > 0) {
+				bestMatch = candidate;
+			}
+		}
+	}
+
+	return bestMatch;
+}
+
+function getMarketplaceManifestUrl(value: unknown): string | null {
+	if (!isRecord(value)) return null;
+
+	let bestMatch: { version: string; source: string } | null = null;
+
+	for (const result of getArray(value.results)) {
+		if (!isRecord(result)) continue;
+		for (const extension of getArray(result.extensions)) {
+			if (!isRecord(extension)) continue;
+			for (const version of getArray(extension.versions)) {
+				if (!isRecord(version)) continue;
+				const versionNumber = parseVersionLike(getString(version, "version"));
+				if (!versionNumber) continue;
+				for (const file of getArray(version.files)) {
+					if (!isRecord(file)) continue;
+					if (getString(file, "assetType") !== MARKETPLACE_MANIFEST_ASSET_TYPE) continue;
+					const source = getString(file, "source");
+					if (!source) continue;
+					if (!bestMatch || compareVersionLike(versionNumber, bestMatch.version) > 0) {
+						bestMatch = { version: versionNumber, source };
+					}
+				}
+			}
+		}
+	}
+
+	return bestMatch?.source ?? null;
+}
+
+async function fetchLatestCopilotClientVersionInfo(): Promise<CopilotClientVersionInfo | null> {
+	const response = await fetch(MARKETPLACE_EXTENSION_QUERY_URL, {
+		method: "POST",
+		headers: {
+			Accept: "application/json;api-version=7.2-preview.1",
+			"Content-Type": "application/json",
+			"User-Agent": USER_AGENT_FALLBACK,
+		},
+		body: JSON.stringify({
+			filters: [{ criteria: [{ filterType: 7, value: COPILOT_CHAT_EXTENSION_ID }] }],
+			flags: MARKETPLACE_QUERY_FLAGS,
+		}),
+	});
+
+	if (!response.ok) {
+		throw new Error(`Unable to fetch GitHub Copilot Chat marketplace metadata: ${response.status}`);
+	}
+
+	const metadata = (await response.json()) as unknown;
+	const manifestUrl = getMarketplaceManifestUrl(metadata);
+	if (!manifestUrl) {
+		throw new Error("Unable to find the GitHub Copilot Chat manifest in marketplace metadata.");
+	}
+
+	const manifestResponse = await fetch(manifestUrl, {
+		headers: {
+			Accept: "application/json",
+			"User-Agent": USER_AGENT_FALLBACK,
+		},
+	});
+
+	if (!manifestResponse.ok) {
+		throw new Error(`Unable to fetch the GitHub Copilot Chat manifest: ${manifestResponse.status}`);
+	}
+
+	const manifest = (await manifestResponse.json()) as unknown;
+	if (!isRecord(manifest)) {
+		throw new Error("Unable to parse the GitHub Copilot Chat manifest.");
+	}
+
+	const pluginVersion = parseVersionLike(getString(manifest, "version"));
+	if (!pluginVersion) {
+		throw new Error("GitHub Copilot Chat manifest did not include a usable version.");
+	}
+
+	return {
+		pluginVersion,
+		editorVersion: getCopilotEditorVersionFromManifest(manifest),
+	};
+}
+
+async function resolveCopilotClientVersionInfo(options?: { force?: boolean }): Promise<CopilotClientVersionInfo | null> {
+	const now = Date.now();
+	if (
+		!options?.force &&
+		cachedCopilotClientVersionInfo &&
+		now - cachedCopilotClientVersionInfoFetchedAt < CLIENT_VERSION_INFO_REFRESH_INTERVAL_MS
+	) {
+		return cachedCopilotClientVersionInfo;
+	}
+
+	if (copilotClientVersionInfoRefreshPromise) {
+		return await copilotClientVersionInfoRefreshPromise;
+	}
+
+	copilotClientVersionInfoRefreshPromise = (async () => {
+		const installed = await findInstalledCopilotClientVersionInfo();
+		if (installed?.pluginVersion && installed.editorVersion) {
+			cachedCopilotClientVersionInfo = installed;
+			cachedCopilotClientVersionInfoFetchedAt = Date.now();
+			return installed;
+		}
+
+		try {
+			const latest = await fetchLatestCopilotClientVersionInfo();
+			const merged = installed || latest
+				? {
+					pluginVersion: installed?.pluginVersion ?? latest?.pluginVersion ?? null,
+					editorVersion: installed?.editorVersion ?? latest?.editorVersion ?? null,
+				}
+				: null;
+			cachedCopilotClientVersionInfo = merged;
+			cachedCopilotClientVersionInfoFetchedAt = Date.now();
+			return merged;
+		} catch {
+			cachedCopilotClientVersionInfo = installed;
+			cachedCopilotClientVersionInfoFetchedAt = Date.now();
+			return installed;
+		}
+	})();
+
+	try {
+		return await copilotClientVersionInfoRefreshPromise;
+	} finally {
+		copilotClientVersionInfoRefreshPromise = null;
+	}
+}
+
+function buildCopilotUsageRequestHeaders(refreshToken: string, versionInfo: CopilotClientVersionInfo | null): Record<string, string> {
+	const headers: Record<string, string> = {
+		Accept: "application/json",
+		Authorization: `Bearer ${refreshToken}`,
+		"Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+		"User-Agent": USER_AGENT_FALLBACK,
+	};
+
+	if (versionInfo?.pluginVersion) {
+		headers["User-Agent"] = `${COPILOT_CHAT_USER_AGENT_NAME}/${versionInfo.pluginVersion}`;
+		headers["Editor-Plugin-Version"] = `${COPILOT_CHAT_PLUGIN_NAME}/${versionInfo.pluginVersion}`;
+	}
+
+	if (versionInfo?.editorVersion) {
+		headers["Editor-Version"] = `vscode/${versionInfo.editorVersion}`;
+	}
+
+	return headers;
 }
 
 async function readCopilotCredentials(): Promise<CopilotCredentials | null> {
@@ -363,7 +597,7 @@ async function fetchModelMultiplierRows(): Promise<CopilotModelMultiplierRow[]> 
 	const response = await fetch(MODEL_MULTIPLIERS_URL, {
 		headers: {
 			Accept: "text/plain",
-			"User-Agent": USER_AGENT,
+			"User-Agent": USER_AGENT_FALLBACK,
 		},
 	});
 
@@ -550,15 +784,15 @@ async function fetchUsage(): Promise<UsageState> {
 		return { status: "missing-auth" };
 	}
 
+	let clientVersionInfo: CopilotClientVersionInfo | null = null;
+	try {
+		clientVersionInfo = await resolveCopilotClientVersionInfo();
+	} catch {
+		clientVersionInfo = null;
+	}
+
 	const response = await fetch(getUserInfoUrl(credentials.enterpriseUrl), {
-		headers: {
-			Accept: "application/json",
-			Authorization: `Bearer ${credentials.refreshToken}`,
-			"User-Agent": USER_AGENT,
-			"Editor-Version": EDITOR_VERSION,
-			"Editor-Plugin-Version": EDITOR_PLUGIN_VERSION,
-			"Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-		},
+		headers: buildCopilotUsageRequestHeaders(credentials.refreshToken, clientVersionInfo),
 	});
 
 	const body = (await response.json()) as unknown;
