@@ -658,6 +658,10 @@ function getFooterPercentTone(percentRemaining: number | null): "dim" | "warning
 }
 
 function statusText(ctx: ExtensionContext, usage: UsageState): string | undefined {
+	if (ctx.model?.provider !== "github-copilot") {
+		return undefined;
+	}
+
 	const theme = ctx.ui.theme;
 	const requestInfo = usage.status === "ok" ? getCopilotModelRequestInfo(ctx.model, usage.plan) : null;
 

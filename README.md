@@ -4,7 +4,7 @@ Pi extension that shows your GitHub Copilot plan usage in pi's footer.
 
 ## What it displays
 
-- A low-profile footer status with used vs allocated Copilot quota, percent left, and the current GitHub Copilot model's premium-request cost per user message, for example `copilot 179.2/1.5k 88% left 1 req/msg`
+- A low-profile footer status that appears only when a GitHub Copilot model is selected, showing used vs allocated Copilot quota, percent left, and the current model's premium-request cost per user message, for example `copilot 179.2/1.5k 88% left 1 req/msg`
 - Overage-aware usage when requests exceed the included plan amount, including ratios like `1.6k/1.5k` and explicit overage display
 - The relevant quota bucket (`premium`, `chat`, `completions`, etc.) when it is useful to show
 - A `/copilot-usage` command that shows all available quota snapshots in a width-aware CLI table, plus the selected GitHub Copilot model and its per-message premium-request cost
