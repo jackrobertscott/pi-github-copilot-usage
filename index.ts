@@ -46,6 +46,18 @@ type UsageRow = {
 	overageEnabled: boolean;
 };
 
+type CopilotModelRequestInfo = {
+	modelId: string;
+	modelName: string;
+	requestsPerMessage: number | null;
+};
+
+type CopilotModelMultiplierRow = {
+	name: string;
+	paidRequestsPerMessage: number | null;
+	freeRequestsPerMessage: number | null;
+};
+
 type UsageState =
 	| {
 			status: "loading";
@@ -79,6 +91,7 @@ type UsageReportMessageDetails =
 			plan?: string;
 			updatedAt?: string;
 			rows: UsageRow[];
+			requestInfo: CopilotModelRequestInfo | null;
 	  }
 	| {
 			status: "missing-auth";
@@ -113,6 +126,13 @@ const EDITOR_VERSION = "vscode/1.107.0";
 const EDITOR_PLUGIN_VERSION = "copilot-chat/0.35.0";
 const COPILOT_INTEGRATION_ID = "vscode-chat";
 const SNAPSHOT_ORDER: SnapshotKind[] = ["premium_interactions", "premium_models", "chat", "completions"];
+const MODEL_MULTIPLIERS_URL = "https://raw.githubusercontent.com/github/docs/main/data/tables/copilot/model-multipliers.yml";
+const MODEL_MULTIPLIERS_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+
+let cachedModelMultiplierRows: CopilotModelMultiplierRow[] = [];
+let cachedModelMultiplierLookup = new Map<string, CopilotModelMultiplierRow>();
+let cachedModelMultiplierFetchedAt = 0;
+let modelMultiplierRefreshPromise: Promise<void> | null = null;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
@@ -217,6 +237,201 @@ function hasQuotaData(snapshot: QuotaSnapshot): boolean {
 
 function clamp(value: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, value));
+}
+
+
+function normalizeCopilotPlan(plan?: string): string | null {
+	const normalized = plan?.trim().toLowerCase();
+	return normalized ? normalized : null;
+}
+
+function isCopilotFreePlan(plan?: string): boolean {
+	const normalizedPlan = normalizeCopilotPlan(plan);
+	return normalizedPlan !== null && normalizedPlan.includes("free");
+}
+
+function normalizeWhitespace(value: string): string {
+	return value.replace(/\s+/g, " ").trim();
+}
+
+function parseYamlScalar(value: string): string {
+	const trimmed = value.trim();
+	if (!trimmed) return "";
+	if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+		return trimmed.slice(1, -1);
+	}
+	return trimmed;
+}
+
+function parseModelMultiplierValue(value: string): number | null {
+	const parsedValue = parseYamlScalar(value);
+	if (!parsedValue || /^not applicable$/i.test(parsedValue)) return null;
+	const numericValue = Number(parsedValue);
+	return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function parseModelMultiplierRows(yamlText: string): CopilotModelMultiplierRow[] {
+	const rows: CopilotModelMultiplierRow[] = [];
+	let currentRow: Partial<CopilotModelMultiplierRow> | null = null;
+
+	const pushCurrentRow = (): void => {
+		if (!currentRow?.name) return;
+		rows.push({
+			name: currentRow.name,
+			paidRequestsPerMessage: currentRow.paidRequestsPerMessage ?? null,
+			freeRequestsPerMessage: currentRow.freeRequestsPerMessage ?? null,
+		});
+		currentRow = null;
+	};
+
+	for (const line of yamlText.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+
+		if (trimmed.startsWith("- name:")) {
+			pushCurrentRow();
+			currentRow = { name: parseYamlScalar(trimmed.slice("- name:".length)) };
+			continue;
+		}
+
+		if (!currentRow) continue;
+		if (trimmed.startsWith("multiplier_paid:")) {
+			currentRow.paidRequestsPerMessage = parseModelMultiplierValue(trimmed.slice("multiplier_paid:".length));
+			continue;
+		}
+		if (trimmed.startsWith("multiplier_free:")) {
+			currentRow.freeRequestsPerMessage = parseModelMultiplierValue(trimmed.slice("multiplier_free:".length));
+		}
+	}
+
+	pushCurrentRow();
+	return rows;
+}
+
+function getModelLookupKeys(...values: Array<string | undefined>): string[] {
+	const normalizedKeys = new Set<string>();
+	const transforms: Array<(value: string) => string> = [
+		(value) => value.replace(/[-_]+/g, " "),
+		(value) => value.replace(/\(preview\)/gi, " "),
+		(value) => value.replace(/\bpublic preview\b/gi, " "),
+		(value) => value.replace(/\bpreview\b/gi, " "),
+		(value) => value.replace(/\bfast mode\b/gi, " fast "),
+		(value) => value.replace(/\bmode\b/gi, " "),
+	];
+
+	for (const value of values) {
+		const initial = normalizeWhitespace(value ?? "");
+		if (!initial) continue;
+
+		const variants = new Set<string>([initial]);
+		let changed = true;
+		while (changed) {
+			changed = false;
+			for (const variant of Array.from(variants)) {
+				for (const transform of transforms) {
+					const nextVariant = normalizeWhitespace(transform(variant));
+					if (nextVariant && !variants.has(nextVariant)) {
+						variants.add(nextVariant);
+						changed = true;
+					}
+				}
+			}
+		}
+
+		for (const variant of variants) {
+			const key = variant.toLowerCase().replace(/[^a-z0-9]+/g, "");
+			if (key) normalizedKeys.add(key);
+		}
+	}
+
+	return Array.from(normalizedKeys);
+}
+
+function buildModelMultiplierLookup(rows: CopilotModelMultiplierRow[]): Map<string, CopilotModelMultiplierRow> {
+	const lookup = new Map<string, CopilotModelMultiplierRow>();
+	for (const row of rows) {
+		for (const key of getModelLookupKeys(row.name)) {
+			if (!lookup.has(key)) {
+				lookup.set(key, row);
+			}
+		}
+	}
+	return lookup;
+}
+
+async function fetchModelMultiplierRows(): Promise<CopilotModelMultiplierRow[]> {
+	const response = await fetch(MODEL_MULTIPLIERS_URL, {
+		headers: {
+			Accept: "text/plain",
+			"User-Agent": USER_AGENT,
+		},
+	});
+
+	if (!response.ok) {
+		throw new Error(`Unable to fetch Copilot model multipliers: ${response.status}`);
+	}
+
+	const yamlText = await response.text();
+	const rows = parseModelMultiplierRows(yamlText);
+	if (rows.length === 0) {
+		throw new Error("Unable to parse Copilot model multipliers from GitHub Docs.");
+	}
+
+	return rows;
+}
+
+async function refreshModelMultiplierCache(options?: { force?: boolean }): Promise<void> {
+	const now = Date.now();
+	if (
+		!options?.force &&
+		cachedModelMultiplierLookup.size > 0 &&
+		now - cachedModelMultiplierFetchedAt < MODEL_MULTIPLIERS_REFRESH_INTERVAL_MS
+	) {
+		return;
+	}
+
+	if (modelMultiplierRefreshPromise) {
+		await modelMultiplierRefreshPromise;
+		return;
+	}
+
+	modelMultiplierRefreshPromise = (async () => {
+		const rows = await fetchModelMultiplierRows();
+		cachedModelMultiplierRows = rows;
+		cachedModelMultiplierLookup = buildModelMultiplierLookup(rows);
+		cachedModelMultiplierFetchedAt = Date.now();
+	})();
+
+	try {
+		await modelMultiplierRefreshPromise;
+	} finally {
+		modelMultiplierRefreshPromise = null;
+	}
+}
+
+function findModelMultiplierRow(model: ExtensionContext["model"]): CopilotModelMultiplierRow | null {
+	if (!model || model.provider !== "github-copilot" || cachedModelMultiplierRows.length === 0) return null;
+	for (const key of getModelLookupKeys(model.name, model.id)) {
+		const row = cachedModelMultiplierLookup.get(key);
+		if (row) return row;
+	}
+	return null;
+}
+
+function getRequestsPerMessageForModel(model: ExtensionContext["model"], plan?: string): number | null {
+	const row = findModelMultiplierRow(model);
+	if (!row) return null;
+	return isCopilotFreePlan(plan) ? row.freeRequestsPerMessage : row.paidRequestsPerMessage;
+}
+
+function getCopilotModelRequestInfo(model: ExtensionContext["model"], plan?: string): CopilotModelRequestInfo | null {
+	if (!model || model.provider !== "github-copilot") return null;
+	if (cachedModelMultiplierLookup.size === 0) return null;
+	return {
+		modelId: model.id,
+		modelName: model.name,
+		requestsPerMessage: getRequestsPerMessageForModel(model, plan),
+	};
 }
 
 function toUsageRow(kind: SnapshotKind, snapshot: QuotaSnapshot, fallbackResetDate?: string): UsageRow {
@@ -376,6 +591,26 @@ function formatNumber(value: number | null): string {
 	return Number.isInteger(rounded) ? `${rounded.toFixed(0)}` : `${rounded.toFixed(1)}`;
 }
 
+function formatRequestValue(value: number | null): string {
+	if (value === null || !Number.isFinite(value)) return "?";
+	const rounded = Math.round(value * 100) / 100;
+	if (Number.isInteger(rounded)) return `${rounded.toFixed(0)}`;
+	if (Number.isInteger(rounded * 10)) return rounded.toFixed(1);
+	return rounded.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function formatRequestRateCompact(value: number | null): string {
+	return `${formatRequestValue(value)} req/msg`;
+}
+
+function formatRequestRateVerbose(value: number | null): string {
+	return value === null ? "unknown" : `${formatRequestValue(value)} premium requests per user message`;
+}
+
+function getRequestRateTone(value: number | null): "dim" | "warning" {
+	return value !== null && value > 1 ? "warning" : "dim";
+}
+
 function formatKind(kind: SnapshotKind): string {
 	switch (kind) {
 		case "premium_interactions":
@@ -424,6 +659,7 @@ function getFooterPercentTone(percentRemaining: number | null): "dim" | "warning
 
 function statusText(ctx: ExtensionContext, usage: UsageState): string | undefined {
 	const theme = ctx.ui.theme;
+	const requestInfo = usage.status === "ok" ? getCopilotModelRequestInfo(ctx.model, usage.plan) : null;
 
 	if (usage.status === "loading") {
 		return undefined;
@@ -453,10 +689,15 @@ function statusText(ctx: ExtensionContext, usage: UsageState): string | undefine
 		parts.push(theme.fg("warning", overage));
 	}
 
+	if (requestInfo) {
+		parts.push(theme.fg("dim", " "));
+		parts.push(theme.fg(getRequestRateTone(requestInfo.requestsPerMessage), formatRequestRateCompact(requestInfo.requestsPerMessage)));
+	}
+
 	return parts.join("");
 }
 
-function summaryText(usage: UsageState): string {
+function summaryText(usage: UsageState, model: ExtensionContext["model"]): string {
 	if (usage.status === "loading") {
 		return "GitHub Copilot usage is loading.";
 	}
@@ -469,6 +710,7 @@ function summaryText(usage: UsageState): string {
 		return usage.message;
 	}
 
+	const requestInfo = getCopilotModelRequestInfo(model, usage.plan);
 	const total = usage.unlimited ? "∞" : formatNumber(usage.total);
 	const remaining = usage.unlimited ? "∞" : formatNumber(usage.remaining);
 	const reset = formatResetDate(usage.resetDate);
@@ -490,11 +732,14 @@ function summaryText(usage: UsageState): string {
 	if (usage.overageEnabled) {
 		parts.push("overages enabled");
 	}
+	if (requestInfo) {
+		parts.push(`${requestInfo.modelName} ${formatRequestRateCompact(requestInfo.requestsPerMessage)}`);
+	}
 
 	return parts.join(" · ");
 }
 
-function toReportDetails(usage: UsageState): UsageReportMessageDetails {
+function toReportDetails(usage: UsageState, model: ExtensionContext["model"]): UsageReportMessageDetails {
 	if (usage.status === "missing-auth") {
 		return { status: "missing-auth" };
 	}
@@ -513,6 +758,7 @@ function toReportDetails(usage: UsageState): UsageReportMessageDetails {
 		plan: usage.plan,
 		updatedAt,
 		rows: usage.rows,
+		requestInfo: getCopilotModelRequestInfo(model, usage.plan),
 	};
 }
 
@@ -710,6 +956,12 @@ function buildReportLines(
 	if (details.plan) {
 		lines.push(truncateToWidth(`${theme.fg("dim", "Plan:")} ${details.plan}`, safeWidth));
 	}
+	if (details.requestInfo) {
+		lines.push(truncateToWidth(`${theme.fg("dim", "Model:")} ${details.requestInfo.modelName}`, safeWidth));
+		lines.push(
+			truncateToWidth(`${theme.fg("dim", "Per user msg:")} ${formatRequestRateVerbose(details.requestInfo.requestsPerMessage)}`, safeWidth),
+		);
+	}
 
 	const updated = formatDateTime(details.updatedAt);
 	if (updated) {
@@ -762,9 +1014,16 @@ export default function githubCopilotUsageExtension(pi: ExtensionAPI) {
 		}
 
 		refreshPromise = (async () => {
+			const shouldRefreshMultipliers = ctx.model?.provider === "github-copilot";
+			const multipliersPromise = shouldRefreshMultipliers
+				? refreshModelMultiplierCache().catch(() => undefined)
+				: Promise.resolve();
+
 			try {
 				currentUsage = await fetchUsage();
 				lastRefreshAt = Date.now();
+				updateStatus(ctx);
+				await multipliersPromise;
 				updateStatus(ctx);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -802,9 +1061,9 @@ export default function githubCopilotUsageExtension(pi: ExtensionAPI) {
 			await refresh(ctx, { force: true });
 			pi.sendMessage({
 				customType: REPORT_MESSAGE_TYPE,
-				content: summaryText(currentUsage),
+				content: summaryText(currentUsage, ctx.model),
 				display: true,
-				details: toReportDetails(currentUsage),
+				details: toReportDetails(currentUsage, ctx.model),
 			});
 		},
 	});
